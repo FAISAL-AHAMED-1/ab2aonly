@@ -1,0 +1,67 @@
+name: ab2aonly
+on:
+  workflow_dispatch:
+    inputs:
+      gsi_url:
+        description: 'Direct URL of GSI (.img / .img.xz / .img.gz)'
+        required: true
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq e2fsprogs xz-utils attr android-sdk-libsparse-utils
+      - name: Download
+        env:
+          URL: ${{ inputs.gsi_url }}
+        run: |
+          set -e
+          sudo mkdir -p /mnt/w && sudo chown "$USER" /mnt/w && cd /mnt/w
+          curl -L --fail --retry 3 -o gsi.bin "$URL"
+          case "$URL" in
+            *.xz) mv gsi.bin gsi.img.xz; xz -d gsi.img.xz ;;
+            *.gz) mv gsi.bin gsi.img.gz; gzip -d gsi.img.gz ;;
+            *) mv gsi.bin gsi.img ;;
+          esac
+          if [ "$(head -c4 gsi.img | od -An -tx1 | tr -d ' \n')" = "3aff26ed" ]; then simg2img gsi.img g.raw && mv g.raw gsi.img; fi
+          ls -l gsi.img
+      - name: Convert
+        run: |
+          set -e
+          cd /mnt/w && mkdir -p ab new && sudo mount -o loop,ro gsi.img ab
+          ls ab | head -40
+          if [ -f ab/system/build.prop ]; then SRC=/mnt/w/ab/system; echo "layout: A/B (system-as-root)"
+          elif [ -f ab/build.prop ]; then SRC=/mnt/w/ab; echo "layout: already A-only"
+          else echo "unknown layout"; exit 1; fi
+          USED=$(sudo du -sb "$SRC" | cut -f1)
+          SIZE=$(( USED * 108 / 100 + 64*1024*1024 )); SIZE=$(( (SIZE + 4095) / 4096 * 4096 ))
+          truncate -s "$SIZE" system-aonly.img
+          sudo mke2fs -q -t ext4 -b 4096 -L system -m 0 -O ^has_journal -E root_owner=0:0 -d "$SRC" system-aonly.img
+          sudo e2fsck -fn system-aonly.img
+          sudo mount -o loop,ro system-aonly.img new
+          A=$(sudo getfattr -R -h -n security.selinux "$SRC" 2>/dev/null | grep -c 'security.selinux=' || true)
+          B=$(sudo getfattr -R -h -n security.selinux new 2>/dev/null | grep -c 'security.selinux=' || true)
+          echo "selinux labels src=$A new=$B"
+          if [ "$A" -lt 1000 ] || [ "$A" != "$B" ]; then echo "LABEL CHECK FAILED"; exit 1; fi
+          {
+            echo "src bytes: $USED  image bytes: $SIZE  labels: $A"
+            sudo getfattr -h -n security.selinux new/bin/sh new/bin/init || true
+            sudo find "$SRC" -maxdepth 5 -type d \( -name 'vndk-27' -o -name 'vndk-sp-27' -o -name 'com.android.vndk.v27*' \) || true
+            sudo find "$SRC" \( -name libbinder.so -o -name libhwbinder.so \) | head -6 || true
+          } > report.txt 2>&1
+          cd "$SRC" && sudo find . -maxdepth 5 -type d \( -name 'vndk-27' -o -name 'vndk-sp-27' -o -name 'com.android.vndk.v27*' \) > /mnt/w/dirs.txt
+          cd /mnt/w
+          if [ -s dirs.txt ]; then sudo tar czf vndk27.tar.gz -C "$SRC" $(cat dirs.txt); else echo "no vndk27 dirs found" >> report.txt; fi
+          xz -T0 -3 -c system-aonly.img > system-aonly.img.xz
+          ls -l /mnt/w
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aonly-image
+          path: /mnt/w/system-aonly.img.xz
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vndk27-and-report
+          path: |
+            /mnt/w/vndk27.tar.gz
+            /mnt/w/report.txt
